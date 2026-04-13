@@ -9,12 +9,12 @@
  */
 
 import {
-  openDB,
-  savePDF,
-  getAllPDFsMeta,
-  getPDFById,
-  updatePDFProgress,
-  deletePDFById,
+  saveDocument,
+  getAllDocumentsMeta,
+  getDocumentById,
+  getProgress,
+  saveProgress,
+  deleteDocument,
 } from './db.js';
 
 // ── PDF.js worker source (loaded from same CDN) ──────────────────────────────
@@ -117,7 +117,7 @@ function showScreen(name) {
 // ── Library ───────────────────────────────────────────────────────────────────
 async function loadLibrary() {
   try {
-    state.pdfs = await getAllPDFsMeta();
+    state.pdfs = await getAllDocumentsMeta();
     renderLibrary();
   } catch (err) {
     showToast('Failed to load library: ' + err.message, 'error');
@@ -210,7 +210,7 @@ async function importFile(file) {
   try {
     const arrayBuffer = await file.arrayBuffer();
     const blob = new Blob([arrayBuffer], { type: 'application/pdf' });
-    const id = await savePDF({ name: file.name, size: file.size, blob });
+    const id = await saveDocument({ name: file.name, size: file.size, blob });
     await loadLibrary();
     showToast(`"${file.name}" imported successfully.`, 'success');
     // Optionally open immediately
@@ -236,36 +236,45 @@ async function openPDF(id) {
     // Ensure PDF.js is ready
     await ensurePDFjs();
 
-    const record = await getPDFById(id);
-    if (!record) throw new Error('PDF not found in storage.');
+    // Read blob and progress separately — never combine them in one write later.
+    // getDocumentById fetches the blob from the documents store (read-only).
+    // getProgress fetches lastPage from the progress store (read-only).
+    // These are two independent reads; no transaction spans both.
+    const doc      = await getDocumentById(id);
+    if (!doc) throw new Error('PDF not found in storage.');
+    const progress = await getProgress(id);
 
-    const blobUrl = URL.createObjectURL(record.blob);
+    const blobUrl = URL.createObjectURL(doc.blob);
 
     // Load document
-    const loadingTask = pdfjsLib.getDocument({ url: blobUrl, cMapUrl: `${PDFJS_CDN}/cmaps/`, cMapPacked: true });
+    const loadingTask = pdfjsLib.getDocument({
+      url: blobUrl,
+      cMapUrl: `${PDFJS_CDN}/cmaps/`,
+      cMapPacked: true,
+    });
     const pdfDoc = await loadingTask.promise;
 
-    // Clean up previous
+    // Clean up previous document
     if (state.currentDoc) {
       state.currentDoc.destroy();
       if (state._blobUrl) URL.revokeObjectURL(state._blobUrl);
     }
 
-    state.currentDoc    = pdfDoc;
-    state.currentPdfId  = id;
-    state.totalPages    = pdfDoc.numPages;
-    state.currentPage   = record.lastPage || 1;
-    state._blobUrl      = blobUrl;
+    state.currentDoc   = pdfDoc;
+    state.currentPdfId = id;
+    state.totalPages   = pdfDoc.numPages;
+    state.currentPage  = progress?.lastPage || 1;
+    state._blobUrl     = blobUrl;
 
-    readerFilename.textContent = record.name;
-    pageTotal.textContent = `/ ${state.totalPages}`;
+    readerFilename.textContent = doc.name;
+    pageTotal.textContent      = `/ ${state.totalPages}`;
 
-    // Set initial zoom
     await renderPage(state.currentPage);
     updateNavButtons();
 
-    // Mark as opened
-    await updatePDFProgress(id, state.currentPage);
+    // Record that the PDF was opened — writes ONLY { docId, lastPage, lastOpened }
+    // to the progress store.  The blob in the documents store is never touched.
+    await saveProgress({ docId: id, lastPage: state.currentPage });
     await loadLibrary(); // refresh card last-opened date
   } catch (err) {
     showToast('Failed to open PDF: ' + err.message, 'error');
@@ -293,9 +302,12 @@ async function renderPage(pageNum) {
     pageInput.value   = pageNum;
     updateNavButtons();
 
-    // Persist progress
+    // Persist reading progress.  saveProgress writes only plain numbers to the
+    // progress store — it never reads or re-writes the PDF blob.
     if (state.currentPdfId) {
-      updatePDFProgress(state.currentPdfId, pageNum).catch(() => {});
+      saveProgress({ docId: state.currentPdfId, lastPage: pageNum }).catch((err) => {
+        console.warn('[Reader] Failed to save progress:', err);
+      });
     }
   } finally {
     state.rendering = false;
@@ -363,7 +375,8 @@ async function executeDelete() {
   deleteModal.classList.remove('open');
 
   try {
-    await deletePDFById(id);
+    // deleteDocument removes from both stores atomically in one transaction
+    await deleteDocument(id);
     await loadLibrary();
     showToast('PDF deleted from local library.', 'success');
   } catch (err) {
