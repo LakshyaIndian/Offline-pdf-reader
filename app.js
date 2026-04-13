@@ -38,7 +38,7 @@ const state = {
   zoomScale: 1.0,
   /** 'fit-width' | 'fit-page' | number */
   zoomMode: 'fit-width',
-  /** Reading theme: 'default' | 'dim' | 'warm' */
+  /** Reading theme: 'default' | 'dim' | 'warm' | 'invert' */
   theme: 'default',
   /** Whether a render is in progress (prevents double-renders) */
   rendering: false,
@@ -89,6 +89,9 @@ const toastContainer   = $('#toast-container');
 async function init() {
   registerServiceWorker();
   setupEventListeners();
+  // Restore previously chosen theme before rendering anything
+  const savedTheme = localStorage.getItem('pdfReaderTheme') || 'default';
+  applyTheme(savedTheme);
   await loadLibrary();
   showScreen('library');
 }
@@ -369,16 +372,41 @@ async function executeDelete() {
 }
 
 // ── Appearance / theme ────────────────────────────────────────────────────────
-function applyTheme(theme) {
-  document.body.classList.remove('theme-dim', 'theme-warm');
-  state.theme = theme;
-  if (theme === 'dim')  document.body.classList.add('theme-dim');
-  if (theme === 'warm') document.body.classList.add('theme-warm');
+// CSS filter classes are placed on #reader-screen (not on body or the canvas).
+// This makes the selectors explicit and stable — they survive canvas redraws,
+// zoom changes, and page turns without any re-application needed.
+//
+// body.theme-dim is kept for UI-chrome dimming only (sidebar, toolbar, etc.)
+//
+// Available themes:
+//   'default' — dark app chrome, PDF rendered as-is (no canvas filter)
+//   'dim'     — dark chrome + brightness(0.62) on canvas for night reading
+//   'warm'    — sepia(28%) + brightness(0.90) warm paper tone on canvas
+//   'invert'  — invert(1) hue-rotate(180deg) experimental dark-page mode
+//               (may distort colour images/charts — opt-in only)
 
-  // Highlight active option
+const READER_THEME_CLASSES = ['reader-theme-dim', 'reader-theme-warm', 'reader-theme-invert'];
+
+function applyTheme(theme) {
+  state.theme = theme;
+
+  // 1. Canvas-level filter: toggle class on #reader-screen.
+  //    CSS rules in styles.css target #pdf-canvas inside these classes.
+  readerScreen.classList.remove(...READER_THEME_CLASSES);
+  if (theme !== 'default') {
+    readerScreen.classList.add(`reader-theme-${theme}`);
+  }
+
+  // 2. UI chrome: only 'dim' darkens the surrounding interface
+  document.body.classList.toggle('theme-dim', theme === 'dim');
+
+  // 3. Update active indicator in the appearance panel
   document.querySelectorAll('.appearance-option').forEach((el) => {
     el.classList.toggle('active', el.dataset.theme === theme);
   });
+
+  // 4. Persist selection so it survives page reloads
+  try { localStorage.setItem('pdfReaderTheme', theme); } catch (_) {}
 }
 
 // ── Event listeners ───────────────────────────────────────────────────────────

@@ -45,22 +45,18 @@
 
   --transition: 0.18s ease;
 
-  /* Reader appearance vars (overridden by JS) */
-  --reader-bg:     #1a1612;
-  --reader-canvas-filter: none;
+  /* Reader background (used by canvas-container) */
+  --reader-bg: #1a1612;
 }
 
-/* Extra-dim theme */
+/* ── App-chrome dimming for "extra dim" mode ────────────────────────────────
+ * Only affects the surrounding UI; canvas filter is handled separately below.
+ */
 body.theme-dim {
   --bg-primary:   #110e0b;
   --bg-secondary: #161210;
   --bg-card:      #1c1815;
   --reader-bg:    #110e0b;
-}
-
-/* Warm tint theme */
-body.theme-warm {
-  --reader-canvas-filter: sepia(35%) brightness(0.92);
 }
 
 html { font-size: 16px; scroll-behavior: smooth; }
@@ -483,7 +479,21 @@ input:focus, select:focus {
   flex-shrink: 0;
 }
 
-/* Canvas area */
+/* ── Canvas area ─────────────────────────────────────────────────────────────
+ * PDFs are rendered as pixel bitmaps onto a <canvas> element by PDF.js.
+ * "True dark mode" for PDF content is not possible without re-rasterising
+ * every page pixel. Instead we apply CSS filters to the canvas DOM element.
+ *
+ * CSS filters operate on the composited bitmap AFTER painting, so:
+ *  - Text inside the canvas stays sharp (no sub-pixel blur)
+ *  - Effects persist across page turns, zoom changes, and document reloads
+ *    because the class lives on #reader-screen, not on the canvas itself
+ *  - Scanned / image-heavy PDFs respond correctly to brightness and sepia
+ *
+ * Filter classes are toggled on #reader-screen by applyTheme() in app.js.
+ * Explicit selectors here are intentional — CSS-variable inheritance can
+ * silently fail after canvas redraws in some browser versions.
+ */
 #canvas-container {
   flex: 1;
   overflow-y: auto;
@@ -500,8 +510,45 @@ input:focus, select:focus {
   box-shadow: var(--shadow-lg);
   max-width: 100%;
   display: block;
-  filter: var(--reader-canvas-filter);
-  transition: filter 0.3s;
+  /* Default: no filter — render PDF content unchanged */
+  filter: none;
+  /* Smooth transition when switching themes */
+  transition: filter 0.25s ease;
+}
+
+/* ── Theme: Extra dim ───────────────────────────────────────────────────────
+ * Reduces canvas brightness for low-light / night reading.
+ * Works for both text-based and scanned (image) PDFs.
+ */
+#reader-screen.reader-theme-dim #canvas-container {
+  background: #0d0b09;
+}
+#reader-screen.reader-theme-dim #pdf-canvas {
+  filter: brightness(0.62);
+}
+
+/* ── Theme: Warm tone ───────────────────────────────────────────────────────
+ * Subtle sepia + slight brightness reduction gives a warm paper feel.
+ * Low sepia value (< 35 %) keeps text legible and colours identifiable.
+ */
+#reader-screen.reader-theme-warm #canvas-container {
+  background: #1e1810;
+}
+#reader-screen.reader-theme-warm #pdf-canvas {
+  filter: sepia(28%) brightness(0.90) saturate(0.85);
+}
+
+/* ── Theme: Invert (experimental) ───────────────────────────────────────────
+ * Inverts the page to create a dark-background reading experience.
+ * hue-rotate(180deg) partially compensates colour shifts in images,
+ * but charts, photos, and diagrams can still look wrong.
+ * Disabled by default; user must explicitly choose it.
+ */
+#reader-screen.reader-theme-invert #canvas-container {
+  background: #111111;
+}
+#reader-screen.reader-theme-invert #pdf-canvas {
+  filter: invert(1) hue-rotate(180deg) brightness(0.88);
 }
 
 /* Loading overlay */
