@@ -1,0 +1,26 @@
+{
+  "name": "Offline PDF Reader",
+  "short_name": "PDF Reader",
+  "description": "Read and store PDF files locally in your browser, offline-capable.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#1a1612",
+  "theme_color": "#1a1612",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    {
+      "src": "./icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "./icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
