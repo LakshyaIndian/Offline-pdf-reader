@@ -17,6 +17,13 @@ import {
   deleteDocument,
 } from './db.js';
 
+import {
+  buildSearchIndex,
+  searchIndex,
+  renderHighlights,
+  itemToCanvasRect,
+} from './search.js';
+
 // ── PDF.js worker source (loaded from same CDN) ──────────────────────────────
 // We delay setting this until pdfjsLib is confirmed available.
 const PDFJS_VERSION = '3.11.174';
@@ -42,10 +49,28 @@ const state = {
   theme: 'default',
   /** Whether a render is in progress (prevents double-renders) */
   rendering: false,
-  /** Search filter string */
+  /** Library search filter string */
   searchQuery: '',
-  /** Sort order */
+  /** Library sort order */
   sortOrder: 'newest',
+  /** PDF viewport from the last renderPage() call — used for highlight geometry */
+  currentViewport: null,
+
+  /** In-reader text search state (session-only, never persisted) */
+  search: {
+    /** Text index built from the current PDF's getTextContent() calls */
+    pageIndex: null,
+    /** Whether the index is currently being built */
+    indexBuilding: false,
+    /** AbortController for cancelling an in-progress index build */
+    indexAbort: null,
+    /** All matches found by the most recent search */
+    matches: [],
+    /** Index into matches[] of the currently highlighted match */
+    activeIndex: -1,
+    /** The query string that produced current matches */
+    query: '',
+  },
 };
 
 // ── DOM references ───────────────────────────────────────────────────────────
@@ -74,8 +99,22 @@ const zoomSelect       = $('#zoom-select');
 const btnAppearance    = $('#btn-appearance');
 const appearancePanel  = $('#appearance-panel');
 const pdfCanvas        = $('#pdf-canvas');
+const overlayCanvas    = $('#search-overlay');
+const pdfPageWrap      = $('#pdf-page-wrap');
 const canvasContainer  = $('#canvas-container');
 const readerLoading    = $('#reader-loading');
+
+// Search bar elements
+const searchBar          = $('#search-bar');
+const btnSearchToggle    = $('#btn-search-toggle');
+const readerSearchInput  = $('#reader-search-input');
+const btnSearchClear     = $('#btn-search-clear');
+const searchCountEl      = $('#search-count');
+const btnSearchPrev      = $('#btn-search-prev');
+const btnSearchNext      = $('#btn-search-next');
+const searchMatchCase    = $('#search-match-case');
+const searchWholeWord    = $('#search-whole-word');
+const searchStatusEl     = $('#search-status');
 
 const deleteModal      = $('#delete-modal');
 const deleteModalName  = $('#delete-modal-name');
@@ -276,6 +315,11 @@ async function openPDF(id) {
     // to the progress store.  The blob in the documents store is never touched.
     await saveProgress({ docId: id, lastPage: state.currentPage });
     await loadLibrary(); // refresh card last-opened date
+
+    // Reset search state for the newly opened document, then start building
+    // the text index in the background so search is ready quickly.
+    _resetSearchState();
+    _buildIndexInBackground(pdfDoc);
   } catch (err) {
     showToast('Failed to open PDF: ' + err.message, 'error');
     showScreen('library');
@@ -292,18 +336,25 @@ async function renderPage(pageNum) {
     const page     = await state.currentDoc.getPage(pageNum);
     const viewport = computeViewport(page);
 
-    const ctx = pdfCanvas.getContext('2d');
-    pdfCanvas.width  = viewport.width;
-    pdfCanvas.height = viewport.height;
+    // Resize both canvases to match the viewport
+    pdfCanvas.width     = viewport.width;
+    pdfCanvas.height    = viewport.height;
+    overlayCanvas.width  = viewport.width;
+    overlayCanvas.height = viewport.height;
 
+    const ctx = pdfCanvas.getContext('2d');
     await page.render({ canvasContext: ctx, viewport }).promise;
 
-    state.currentPage = pageNum;
-    pageInput.value   = pageNum;
+    state.currentPage    = pageNum;
+    state.currentViewport = viewport;
+    pageInput.value       = pageNum;
     updateNavButtons();
 
-    // Persist reading progress.  saveProgress writes only plain numbers to the
-    // progress store — it never reads or re-writes the PDF blob.
+    // Re-apply search highlights on top of the freshly rendered page.
+    // This runs after every page turn, zoom change, and window resize,
+    // so highlights always stay aligned with the visible content.
+    _applyHighlights();
+
     if (state.currentPdfId) {
       saveProgress({ docId: state.currentPdfId, lastPage: pageNum }).catch((err) => {
         console.warn('[Reader] Failed to save progress:', err);
@@ -312,6 +363,24 @@ async function renderPage(pageNum) {
   } finally {
     state.rendering = false;
   }
+}
+
+/** Draw (or clear) the search highlight overlay for the current page. */
+function _applyHighlights() {
+  if (!state.currentViewport || !state.search.pageIndex) {
+    // Clear overlay if there's nothing to draw
+    const ctx = overlayCanvas.getContext('2d');
+    ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+    return;
+  }
+  renderHighlights(
+    overlayCanvas,
+    state.currentPage,
+    state.search.matches,
+    state.search.activeIndex,
+    state.currentViewport,
+    state.search.pageIndex,
+  );
 }
 
 function computeViewport(page) {
@@ -460,8 +529,9 @@ function setupEventListeners() {
 
   // Reader: back
   btnBack.addEventListener('click', () => {
+    // Close search bar and clear state before leaving the reader
+    _closeSearchBar();
     showScreen('library');
-    // Destroy doc to free memory
     if (state.currentDoc) {
       state.currentDoc.destroy();
       state.currentDoc = null;
@@ -470,6 +540,8 @@ function setupEventListeners() {
       URL.revokeObjectURL(state._blobUrl);
       state._blobUrl = null;
     }
+    // Abort any in-progress index build
+    state.search.indexAbort?.abort();
   });
 
   // Reader: page navigation
@@ -505,18 +577,84 @@ function setupEventListeners() {
 
   // Reader: keyboard shortcuts
   document.addEventListener('keydown', (e) => {
-    if (readerScreen.classList.contains('active')) {
-      if (e.key === 'ArrowRight' || e.key === 'ArrowDown' || e.key === 'PageDown') {
-        e.preventDefault();
-        if (state.currentPage < state.totalPages) renderPage(state.currentPage + 1);
+    if (!readerScreen.classList.contains('active')) return;
+
+    // Ctrl+F / Cmd+F → open search
+    if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+      e.preventDefault();
+      _openSearchBar();
+      return;
+    }
+
+    // Escape: close search bar first; if already closed, go back to library
+    if (e.key === 'Escape') {
+      if (!searchBar.hidden) {
+        _closeSearchBar();
+      } else {
+        btnBack.click();
       }
-      if (e.key === 'ArrowLeft' || e.key === 'ArrowUp' || e.key === 'PageUp') {
-        e.preventDefault();
-        if (state.currentPage > 1) renderPage(state.currentPage - 1);
-      }
-      if (e.key === 'Escape') btnBack.click();
+      return;
+    }
+
+    // Don't hijack arrow keys when the search input has focus
+    const searchFocused = document.activeElement === readerSearchInput;
+    if (searchFocused) return;
+
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown' || e.key === 'PageDown') {
+      e.preventDefault();
+      if (state.currentPage < state.totalPages) renderPage(state.currentPage + 1);
+    }
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowUp' || e.key === 'PageUp') {
+      e.preventDefault();
+      if (state.currentPage > 1) renderPage(state.currentPage - 1);
     }
   });
+
+  // Search: toggle bar open/closed
+  btnSearchToggle.addEventListener('click', () => {
+    if (searchBar.hidden) {
+      _openSearchBar();
+    } else {
+      _closeSearchBar();
+    }
+  });
+
+  // Search: input (debounced)
+  let _searchDebounce;
+  readerSearchInput.addEventListener('input', () => {
+    clearTimeout(_searchDebounce);
+    btnSearchClear.hidden = !readerSearchInput.value;
+    if (!readerSearchInput.value.trim()) {
+      // Clear immediately — no need to wait
+      _executeSearch();
+    } else {
+      _searchDebounce = setTimeout(_executeSearch, 300);
+    }
+  });
+
+  // Search: Enter key navigates to next/previous match
+  readerSearchInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && state.search.matches.length) {
+      e.preventDefault();
+      _jumpToMatch(state.search.activeIndex + (e.shiftKey ? -1 : 1));
+    }
+  });
+
+  // Search: clear button
+  btnSearchClear.addEventListener('click', () => {
+    readerSearchInput.value = '';
+    btnSearchClear.hidden = true;
+    _executeSearch();
+    readerSearchInput.focus();
+  });
+
+  // Search: navigation
+  btnSearchNext.addEventListener('click', () => _jumpToMatch(state.search.activeIndex + 1));
+  btnSearchPrev.addEventListener('click', () => _jumpToMatch(state.search.activeIndex - 1));
+
+  // Search: option checkboxes re-run search immediately
+  searchMatchCase.addEventListener('change', _executeSearch);
+  searchWholeWord.addEventListener('change', _executeSearch);
 
   // Appearance panel
   btnAppearance.addEventListener('click', (e) => {
@@ -558,6 +696,227 @@ function setupEventListeners() {
       }
     }, 200);
   });
+}
+
+// ── Search: index building ────────────────────────────────────────────────────
+
+/** Reset all search state for a newly opened document. */
+function _resetSearchState() {
+  // Abort previous build if still running
+  state.search.indexAbort?.abort();
+
+  state.search.pageIndex    = null;
+  state.search.indexBuilding = false;
+  state.search.indexAbort   = null;
+  state.search.matches      = [];
+  state.search.activeIndex  = -1;
+  state.search.query        = '';
+
+  // Clear UI
+  readerSearchInput.value = '';
+  btnSearchClear.hidden   = true;
+  _updateCountUI();
+  _setSearchStatus('');
+}
+
+/**
+ * Build the text index for `pdfDoc` in the background.
+ * Updates UI with progress, then re-runs any pending query when done.
+ *
+ * @param {PDFDocumentProxy} pdfDoc
+ */
+async function _buildIndexInBackground(pdfDoc) {
+  state.search.indexAbort    = new AbortController();
+  state.search.indexBuilding = true;
+  const signal = state.search.indexAbort.signal;
+
+  _setSearchStatus(`Indexing… 0 / ${pdfDoc.numPages}`);
+
+  try {
+    const { pageIndex, totalTextChars } = await buildSearchIndex(pdfDoc, {
+      signal,
+      onProgress: (built, total) => {
+        if (!signal.aborted) {
+          _setSearchStatus(`Indexing… ${built} / ${total}`);
+        }
+      },
+    });
+
+    if (signal.aborted) return;
+
+    state.search.pageIndex    = pageIndex;
+    state.search.indexBuilding = false;
+
+    const avgCharsPerPage = pdfDoc.numPages > 0
+      ? totalTextChars / pdfDoc.numPages
+      : 0;
+
+    if (avgCharsPerPage < 10) {
+      _setSearchStatus(
+        'This PDF appears to be scanned or image-based — text search is not available.',
+        'warn',
+      );
+    } else {
+      _setSearchStatus('');
+      // If the user already typed a query while we were indexing, run it now
+      if (state.search.query) {
+        _executeSearch();
+      }
+    }
+  } catch (err) {
+    if (!signal.aborted) {
+      _setSearchStatus('Indexing failed: ' + err.message);
+    }
+  }
+}
+
+// ── Search: query execution ───────────────────────────────────────────────────
+
+/** Run the current search query against the index and update UI + highlights. */
+async function _executeSearch() {
+  const query = readerSearchInput.value.trim();
+  state.search.query = query;
+
+  if (!query) {
+    state.search.matches     = [];
+    state.search.activeIndex = -1;
+    _updateCountUI();
+    _applyHighlights();
+    return;
+  }
+
+  if (!state.search.pageIndex) {
+    // Index is still being built — the query will re-run when done
+    _setSearchStatus(
+      state.search.indexBuilding ? 'Indexing in progress…' : 'No text index available.',
+    );
+    return;
+  }
+
+  const matches = searchIndex(state.search.pageIndex, query, {
+    matchCase: searchMatchCase.checked,
+    wholeWord: searchWholeWord.checked,
+  });
+
+  state.search.matches     = matches;
+  state.search.activeIndex = matches.length > 0 ? 0 : -1;
+
+  _updateCountUI();
+  _setSearchStatus('');
+
+  if (matches.length > 0) {
+    await _jumpToMatch(0);
+  } else {
+    _applyHighlights(); // clears the overlay
+  }
+}
+
+// ── Search: navigation ────────────────────────────────────────────────────────
+
+/**
+ * Navigate to the match at `index` (wraps around).
+ * Navigates to the correct page, re-renders if needed, then scrolls.
+ *
+ * @param {number} index
+ */
+async function _jumpToMatch(index) {
+  const total = state.search.matches.length;
+  if (!total) return;
+
+  // Wrap around in both directions
+  const i = ((index % total) + total) % total;
+  state.search.activeIndex = i;
+  _updateCountUI();
+
+  const match = state.search.matches[i];
+
+  if (match.pageNum !== state.currentPage) {
+    // renderPage() calls _applyHighlights() internally, so highlights will
+    // be drawn on the new page automatically.
+    await renderPage(match.pageNum);
+  } else {
+    // Same page — just redraw overlay with the new active match
+    _applyHighlights();
+  }
+
+  _scrollToActiveMatch();
+}
+
+/** Scroll the canvas container so the active match rect is centred vertically. */
+function _scrollToActiveMatch() {
+  const match = state.search.matches[state.search.activeIndex];
+  if (!match || !state.currentViewport || !state.search.pageIndex) return;
+
+  const page = state.search.pageIndex.find((p) => p.pageNum === match.pageNum);
+  if (!page || !match.itemRanges.length) return;
+
+  const item = page.items[match.itemRanges[0].itemIndex];
+  const rect = itemToCanvasRect(item, state.currentViewport);
+  if (!rect) return;
+
+  // rect.y is relative to the canvas top-left.
+  // The canvas sits inside #pdf-page-wrap which is inside #canvas-container
+  // (with padding).  We offset by the container's padding-top so the
+  // calculation is in the scroll coordinate space.
+  const paddingTop   = parseFloat(getComputedStyle(canvasContainer).paddingTop) || 24;
+  const scrollTarget = paddingTop + rect.y - canvasContainer.clientHeight / 2 + rect.height / 2;
+
+  canvasContainer.scrollTo({ top: Math.max(0, scrollTarget), behavior: 'smooth' });
+}
+
+// ── Search: UI helpers ────────────────────────────────────────────────────────
+
+function _updateCountUI() {
+  const total = state.search.matches.length;
+  const query = state.search.query;
+
+  if (!query) {
+    searchCountEl.textContent = '';
+    searchCountEl.className   = 'search-count';
+    btnSearchPrev.disabled    = true;
+    btnSearchNext.disabled    = true;
+    return;
+  }
+
+  if (total === 0) {
+    searchCountEl.textContent = 'No results';
+    searchCountEl.className   = 'search-count no-results';
+    btnSearchPrev.disabled    = true;
+    btnSearchNext.disabled    = true;
+  } else {
+    searchCountEl.textContent = `${state.search.activeIndex + 1} / ${total}`;
+    searchCountEl.className   = 'search-count has-results';
+    btnSearchPrev.disabled    = false;
+    btnSearchNext.disabled    = false;
+  }
+}
+
+function _setSearchStatus(msg, cls = '') {
+  searchStatusEl.textContent = msg;
+  searchStatusEl.className   = 'search-status' + (cls ? ` ${cls}` : '');
+}
+
+// ── Search: bar open / close ──────────────────────────────────────────────────
+
+function _openSearchBar() {
+  searchBar.hidden = false;
+  btnSearchToggle.classList.add('active');
+  readerSearchInput.focus();
+  readerSearchInput.select();
+}
+
+function _closeSearchBar() {
+  searchBar.hidden = true;
+  btnSearchToggle.classList.remove('active');
+
+  // Clear query + highlights
+  readerSearchInput.value  = '';
+  btnSearchClear.hidden    = true;
+  state.search.query       = '';
+  state.search.matches     = [];
+  state.search.activeIndex = -1;
+  _updateCountUI();
+  _applyHighlights();
 }
 
 // ── Zoom helper ───────────────────────────────────────────────────────────────

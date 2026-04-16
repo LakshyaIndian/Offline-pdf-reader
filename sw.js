@@ -5,7 +5,7 @@
  * need special service-worker handling.
  */
 
-const CACHE_NAME = 'offline-pdf-reader-v1';
+const CACHE_NAME = 'offline-pdf-reader-v2';
 
 // Assets that form the "app shell" — must be available offline.
 // Paths are relative to the service worker scope (repo root on GH Pages).
@@ -15,6 +15,7 @@ const SHELL_ASSETS = [
   './styles.css',
   './app.js',
   './db.js',
+  './search.js',
   './manifest.json',
   './icons/icon-192.png',
   './icons/icon-512.png',

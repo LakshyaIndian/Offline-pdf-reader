@@ -189,6 +189,15 @@
         </button>
       </div>
 
+      <!-- Search toggle -->
+      <button id="btn-search-toggle" class="btn-icon" aria-label="Search in document (Ctrl+F)" title="Search (Ctrl+F)">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="11" cy="11" r="8"/>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+      </button>
+
       <!-- Appearance toggle -->
       <div class="appearance-wrap">
         <button id="btn-appearance" class="btn-icon" aria-label="Reading appearance" aria-haspopup="true">
@@ -232,9 +241,84 @@
 
     </nav><!-- /reader-toolbar -->
 
-    <!-- Canvas area -->
+    <!-- ── Search bar (shown/hidden via #btn-search-toggle) ── -->
+    <div id="search-bar" class="search-bar" hidden aria-label="Search in document">
+
+      <div class="search-bar__row">
+
+        <!-- Query input -->
+        <div class="search-input-wrap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"
+               class="search-input-icon" aria-hidden="true">
+            <circle cx="11" cy="11" r="8"/>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+          <input
+            type="search"
+            id="reader-search-input"
+            placeholder="Search in PDF…"
+            autocomplete="off"
+            autocorrect="off"
+            autocapitalize="off"
+            spellcheck="false"
+            aria-label="Search query"
+          />
+          <button id="btn-search-clear" class="search-btn-clear" aria-label="Clear search" hidden>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="18" y1="6" x2="6" y2="18"/>
+              <line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
+        </div>
+
+        <!-- Result counter -->
+        <span id="search-count" class="search-count" aria-live="polite" aria-atomic="true"></span>
+
+        <!-- Navigation -->
+        <button id="btn-search-prev" class="btn-icon btn-search-nav" aria-label="Previous match" disabled>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="18 15 12 9 6 15"/>
+          </svg>
+        </button>
+        <button id="btn-search-next" class="btn-icon btn-search-nav" aria-label="Next match" disabled>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="6 9 12 15 18 9"/>
+          </svg>
+        </button>
+
+        <!-- Options -->
+        <div class="search-options" role="group" aria-label="Search options">
+          <label class="search-option" title="Match case">
+            <input type="checkbox" id="search-match-case" aria-label="Match case" />
+            <span>Aa</span>
+          </label>
+          <label class="search-option" title="Whole word">
+            <input type="checkbox" id="search-whole-word" aria-label="Whole word" />
+            <span>W</span>
+          </label>
+        </div>
+
+      </div><!-- /.search-bar__row -->
+
+      <!-- Status / progress / scanned notice -->
+      <div id="search-status" class="search-status" aria-live="polite" aria-atomic="true"></div>
+
+    </div><!-- /#search-bar -->
+
+    <!-- Canvas area — #pdf-page-wrap is relative-positioned so the
+         transparent #search-overlay canvas can be stacked on top of
+         #pdf-canvas using position:absolute without affecting layout. -->
     <div id="canvas-container" aria-label="PDF page">
-      <canvas id="pdf-canvas" role="img" aria-label="PDF page content"></canvas>
+      <div id="pdf-page-wrap">
+        <canvas id="pdf-canvas" role="img" aria-label="PDF page content"></canvas>
+        <!-- Overlay canvas for search highlights. pointer-events:none so it
+             doesn't block mouse interaction with the PDF canvas below. -->
+        <canvas id="search-overlay" aria-hidden="true"></canvas>
+      </div>
     </div>
 
     <!-- Reader loading overlay -->
